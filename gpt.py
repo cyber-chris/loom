@@ -2,14 +2,17 @@ import os
 import time
 import traceback
 from pprint import pprint
+import uuid
 
 from celery import Celery
 import openai
+import torch
 from util.util import retry, timestamp
 from util.gpt_util import parse_logit_bias, parse_stop
 import requests
 import codecs
 import json
+from transformers import GPT2Tokenizer, GPT2LMHeadModel
 
 # response dictionary type
 '''
@@ -116,6 +119,11 @@ def generate(config, **kwargs):
         #save_response_json(response, 'examples/openAI_response.json')
         formatted_response = format_openAI_response(response, kwargs['prompt'], echo=True)
         #save_response_json(formatted_response, 'examples/openAI_formatted_response.json')
+        return formatted_response, error
+    elif model_type == 'transformers':
+        response, error = transformers_generate(model_type, **kwargs)
+        print(f"{response['choices'].shape} choices shape")
+        formatted_response = format_transformers_response(response, kwargs['prompt'], echo=False)
         return formatted_response, error
 
 
@@ -335,6 +343,112 @@ def ai21_generate(prompt, length=150, num_continuations=1, logprobs=10, temperat
         error = f'Bad status code {response.status_code}'
         print(request_json)
     return response, error
+
+#################################
+#   Transformers library
+#################################
+
+def transformers_token_position(completion, i):
+    # inefficient
+    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+    text_offset = len(tokenizer.decode(completion[:i]))
+    token_len = len(tokenizer.decode(completion[i]))
+
+    return {'start': text_offset,
+            'end': text_offset + token_len}
+
+
+def format_transformers_token_dict(completion, token, logprobs_i, i):
+    token_dict = {'generatedToken': {'token': token,
+                                     'logprob': logprobs_i[token]},
+                  'position': transformers_token_position(completion, i)}
+    # TODO: counterfactuals, i.e. check the top logprobs in logprobs_i?
+    if False and completion['logprobs'].get('top_logprobs', None) is not None and completion['logprobs']['top_logprobs']:
+        openai_counterfactuals = completion['logprobs']['top_logprobs'][i]
+        if openai_counterfactuals:
+            sorted_counterfactuals = {k: v for k, v in
+                                      sorted(openai_counterfactuals.items(), key=lambda item: item[1], reverse=True)}
+            token_dict['counterfactuals'] = sorted_counterfactuals
+    else:
+        token_dict['counterfactuals'] = None
+    return token_dict
+
+
+def format_transformers_completion(completion, completion_logprobs: list, prompt, prompt_end_index):
+    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+
+    completion_dict = {'text': tokenizer.decode(completion)[len(prompt):],
+                       'finishReason': 'length',
+                       'tokens': []}
+    #for i, token in enumerate(completion['logprobs']['tokens'][prompt_end_index:]):
+    for i, token in enumerate(completion[prompt_end_index:]):
+        j = i + prompt_end_index
+        token_dict = format_transformers_token_dict(completion, token, completion_logprobs[i], j)
+        completion_dict['tokens'].append(token_dict)
+    return completion_dict
+
+
+def format_transformers_prompt(completion, prompt):
+    # TODO: doesn't seem like generate returns the prompt scores
+    prompt_dict = {'text': prompt, 'tokens': []}
+    # loop over tokens until offset >= prompt length
+    for i, token in enumerate(completion['logprobs']['tokens']):
+        if completion['logprobs']['text_offset'][i] >= len(prompt):
+            prompt_end_index = i
+            break
+        token_dict = format_openAI_token_dict(completion, token, i)
+        prompt_dict['tokens'].append(token_dict)
+
+    return prompt_dict, prompt_end_index
+
+
+def format_transformers_response(response, prompt, echo=True):
+    if echo:
+        prompt_dict, prompt_end_index = format_transformers_prompt(response['choices'][0], prompt)
+    else:
+        prompt_dict = {'text': prompt, 'tokens': None}
+        prompt_end_index = 0
+        #prompt = ''
+
+	# HACK
+    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+    prompt_end_index = len(tokenizer.encode(prompt))
+
+    completions = []
+    for i, completion in enumerate(response['choices']):
+        print(f"Formatting completion {i}")
+        completions.append(format_transformers_completion(completion, 
+                                                          list(torch.softmax(s[i], dim=-1) for s in response['scores']), 
+                                                          prompt, 
+                                                          prompt_end_index))
+
+    response_dict = {'completions': completions,
+                     'prompt': prompt_dict,
+                     'id': response['id'],
+                     'model': response['model'],
+                     'timestamp': timestamp()}
+    return response_dict
+
+def transformers_generate(model_type, prompt, length=150, num_continuations=1, logprobs=10, temperature=0.8, top_p=1, stop=None,
+                    model='gpt2', logit_bias=None, **kwargs):
+    tokenizer = GPT2Tokenizer.from_pretrained(model)
+    model = GPT2LMHeadModel.from_pretrained(model)
+    
+    inputs = tokenizer(prompt, return_tensors='pt')
+    output = model.generate(**inputs, 
+                            max_new_tokens=length, 
+                            do_sample=True, 
+                            temperature=temperature, 
+                            num_return_sequences=num_continuations, 
+                            output_scores=True,
+                            return_dict_in_generate=True)
+
+    return {
+        'id': hash(uuid.uuid1()),
+        'model': model,
+        'choices': output.sequences,
+        'scores': output.scores
+    }, None
 
 
 if __name__ == "__main__":

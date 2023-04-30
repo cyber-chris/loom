@@ -104,7 +104,7 @@ DEFAULT_GENERATION_SETTINGS = {
     'prompt_length': 6000,
     'logprobs': 0,
     #"adaptive": False,
-    "model": "davinci",
+    "model": "gpt2",
     "stop": '',  # separated by '|'
     "start": '',
     "restart": '',
@@ -205,6 +205,11 @@ DEFAULT_MODEL_CONFIG = {
             'type': 'gooseai',
             'api_base': None,
             },
+        'gpt2': {
+            'model': 'gpt2',
+            'type': 'transformers',
+            'api_base': None,
+        }
     },
     # 'api_base': None,
     # 'api_key': os.environ.get("API_KEY", ''),
